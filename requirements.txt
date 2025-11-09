@@ -1,5 +1,4 @@
-torch>=2.0.0
-torchvision>=0.15.0
+# torch and torchvision are installed via conda (faster, pre-built binaries)
 accelerate>=0.20.0
 transformers>=4.40.0
 mamba-ssm
