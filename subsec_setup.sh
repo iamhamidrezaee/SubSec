@@ -1,5 +1,7 @@
 #!/bin/bash
 
+source ~/.bashrc
+
 # Helper functions for colored output
 print_step() {
     echo -e "\n\033[1;34m$1\033[0m"
@@ -109,7 +111,7 @@ setup_environment() {
     print_info "Installing PyTorch and torchvision via conda (pre-built binaries, faster)..."
     conda install -y -c pytorch pytorch torchvision
     
-    # Install build dependencies for compiling mamba-ssm and causal-conv1d
+    # Install build dependencies for compiling mamba-ssm, causal-conv1d, and flash-attn
     print_info "Installing build dependencies (compilers, build tools)..."
     conda install -y -c conda-forge ninja cmake gcc_linux-64 gxx_linux-64
     
@@ -126,6 +128,12 @@ setup_environment() {
         print_error "requirements.txt not found at $REQUIREMENTS_FILE"
         exit 1
     fi
+    
+    # Install flash-attn via pip (more reliable than conda for flash-attn)
+    print_info "Installing flash-attn (this may take a few minutes)..."
+    pip install flash-attn --no-build-isolation || {
+        print_warning "Flash-attn installation failed, but continuing. You can install it later with: pip install flash-attn --no-build-isolation"
+    }
     
     # Install remaining packages via pip with parallel builds enabled
     print_info "Installing remaining requirements with parallel compilation (using $MAX_JOBS cores)..."

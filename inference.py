@@ -2,7 +2,6 @@ import torch
 import time
 import threading
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
-from transformers.models.granitemoehybrid.modeling_granitemoehybrid import HybridMambaAttentionDynamicCache
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model_path = "ibm-granite/granite-4.0-h-micro"
@@ -11,7 +10,27 @@ print(f"Loading model from {model_path}...")
 print(f"Using device: {device}")
 
 tokenizer = AutoTokenizer.from_pretrained(model_path)
-model = AutoModelForCausalLM.from_pretrained(model_path, device_map=device)
+
+# Load model with Flash Attention 2 for optimized inference
+# Flash Attention 2 provides up to 2x speedup on attention layers
+try:
+    print("Attempting to load with Flash Attention 2...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map=device,
+        attn_implementation="flash_attention_2",
+        dtype=torch.float16 if device == "cuda" else torch.float32,
+    )
+    print("✓ Flash Attention 2 enabled successfully!")
+except Exception as e:
+    print(f"⚠ Flash Attention 2 not available: {e}")
+    print("Falling back to standard attention (install flash-attn for better performance)")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map=device,
+        dtype=torch.float16 if device == "cuda" else torch.float32,
+    )
+
 model.eval()
 
 print("Model loaded successfully!\n")
@@ -45,25 +64,16 @@ def generate_streaming_response(user_message):
     )
     input_tokens = tokenizer(chat_text, return_tensors="pt").to(device)
 
-    # Initialize fresh cache for this turn to prevent repetitive output
-    # The cache helps within a single generation but doesn't persist across conversation turns
-    current_cache = HybridMambaAttentionDynamicCache(
-        config=model.config,
-        batch_size=1,
-        dtype=model.dtype,
-        device=device
-    )
-
     # Setup streamer
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
 
     # Generation kwargs
+    # The model will handle caching internally with use_cache=True
     generation_kwargs = {
         **input_tokens,
         "max_new_tokens": 512,
         "streamer": streamer,
         "do_sample": False,
-        "past_key_values": current_cache,
         "use_cache": True,
     }
 
