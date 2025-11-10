@@ -91,7 +91,7 @@ setup_conda() {
 # Function to create and set up the conda environment
 setup_environment() {
     print_step "📦 STEP 2: Creating Conda Environment 'subsec'"
-    
+
     # Check if environment already exists
     if conda env list | grep -q "^subsec "; then
         print_info "Environment 'subsec' already exists. Skipping creation."
@@ -100,45 +100,64 @@ setup_environment() {
         conda create -n subsec python=3.11 -y
         print_success "Environment 'subsec' created successfully."
     fi
-    
+
     # Activate the environment
     print_step "🔧 STEP 3: Activating Environment and Installing Dependencies"
     print_info "Activating conda environment 'subsec'..."
     eval "$(conda shell.bash hook)"
     conda activate subsec
-    
-    # Install PyTorch and torchvision via conda (much faster - pre-built binaries)
+
+    # Install PyTorch and torchvision via conda first (to get compatible MKL)
     print_info "Installing PyTorch and torchvision via conda (pre-built binaries, faster)..."
     conda install -y -c pytorch pytorch torchvision
-    
-    # Install build dependencies for compiling mamba-ssm, causal-conv1d, and flash-attn
+
+    # Check if we have MKL compatibility issues and fix if needed
+    print_info "Checking MKL compatibility..."
+    if ! python -c "import torch; print('PyTorch import successful')" 2>/dev/null; then
+        print_warning "PyTorch import failed, trying alternative MKL configuration..."
+        # Try using OpenBLAS instead of MKL to avoid compatibility issues
+        conda install -y -c conda-forge openblas blas=2.116
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    fi
+
+    # Install build dependencies for compiling flash-attn
     print_info "Installing build dependencies (compilers, build tools)..."
     conda install -y -c conda-forge ninja cmake gcc_linux-64 gxx_linux-64
-    
+
     # Set parallel compilation flags for faster builds
     NUM_CORES=$(nproc 2>/dev/null || echo "4")
     export MAX_JOBS="$NUM_CORES"
     export CMAKE_BUILD_PARALLEL_LEVEL="$NUM_CORES"
+
+    # Install transformers and accelerate (needed for inference.py)
+    print_info "Installing transformers and accelerate..."
+    pip install transformers accelerate
+
+    # Install additional packages needed for flash-attn build
+    print_info "Installing packaging and wheel for flash-attn build..."
+    pip install packaging wheel
     
-    # Get the script directory to find requirements.txt
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    REQUIREMENTS_FILE="$SCRIPT_DIR/requirements.txt"
-    
-    if [[ ! -f "$REQUIREMENTS_FILE" ]]; then
-        print_error "requirements.txt not found at $REQUIREMENTS_FILE"
-        exit 1
-    fi
-    
-    # Install flash-attn via pip (more reliable than conda for flash-attn)
-    print_info "Installing flash-attn (this may take a few minutes)..."
-    pip install flash-attn --no-build-isolation || {
-        print_warning "Flash-attn installation failed, but continuing. You can install it later with: pip install flash-attn --no-build-isolation"
+    # Install flash-attn from source to ensure ABI compatibility with conda PyTorch
+    # Building from source ensures binary compatibility with the installed PyTorch version
+    print_info "Installing flash-attn from source (this may take 5-10 minutes)..."
+    print_info "This builds flash-attn against your PyTorch to ensure ABI compatibility..."
+    pip install 'git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3#egg=flash-attn&subdirectory=.' --no-build-isolation || {
+        print_warning "Flash-attn installation failed. This may impact performance but won't prevent the model from running."
+        print_warning "You can try installing it later with: pip install 'git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3#egg=flash-attn&subdirectory=.' --no-build-isolation"
     }
-    
-    # Install remaining packages via pip with parallel builds enabled
-    print_info "Installing remaining requirements with parallel compilation (using $MAX_JOBS cores)..."
-    pip install -r "$REQUIREMENTS_FILE" --no-build-isolation
-    
+
+    # Install Mamba SSM kernels for hybrid Mamba-Attention models (like Granite)
+    # These provide optimized CUDA kernels for Mamba state space model layers
+    print_info "Installing causal-conv1d from source (this may take 2-3 minutes)..."
+    pip install causal-conv1d --no-build-isolation || {
+        print_warning "causal-conv1d installation failed. Mamba layers will use slower fallback implementation."
+    }
+
+    print_info "Installing mamba-ssm from source (this may take 3-5 minutes)..."
+    pip install mamba-ssm --no-build-isolation || {
+        print_warning "mamba-ssm installation failed. Mamba layers will use slower fallback implementation."
+    }
+
     print_success "All dependencies installed successfully!"
 }
 
