@@ -1,5 +1,8 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import time
+import threading
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers.models.granitemoehybrid.modeling_granitemoehybrid import HybridMambaAttentionDynamicCache
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model_path = "ibm-granite/granite-4.0-h-micro"
@@ -11,22 +14,132 @@ tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForCausalLM.from_pretrained(model_path, device_map=device)
 model.eval()
 
-print("Model loaded successfully!")
+print("Model loaded successfully!\n")
 
-# Example inference
-chat = [
-    {"role": "user", "content": "Please write a long essay on the topic of 'The Future of AI', the importance of its regulation, and the every single detail of how AI works from technicals to social aspects."},
-]
+# Conversation history
+conversation_history = []
 
-chat = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-input_tokens = tokenizer(chat, return_tensors="pt").to(device)
+def reset_cache():
+    """Reset the conversation history"""
+    global conversation_history
+    conversation_history = []
 
-print("\nGenerating response...")
-output = model.generate(**input_tokens, max_new_tokens=1000)
-output = tokenizer.batch_decode(output)
+def trim_conversation_history():
+    """Trim conversation history to prevent context from becoming too long"""
+    global conversation_history
+    # Keep only the last 10 turns (5 user + 5 assistant messages) to prevent context from growing too large
+    max_turns = 10
+    if len(conversation_history) > max_turns:
+        conversation_history = conversation_history[-max_turns:]
 
-print("\n" + "="*50)
-print("OUTPUT:")
-print("="*50)
-print(output[0])
+def generate_streaming_response(user_message):
+    """Generate streaming response with metrics"""
+    # Add user message to history
+    conversation_history.append({"role": "user", "content": user_message})
+
+    # Format chat with history
+    chat_text = tokenizer.apply_chat_template(
+        conversation_history,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    input_tokens = tokenizer(chat_text, return_tensors="pt").to(device)
+
+    # Initialize fresh cache for this turn to prevent repetitive output
+    # The cache helps within a single generation but doesn't persist across conversation turns
+    current_cache = HybridMambaAttentionDynamicCache(
+        config=model.config,
+        batch_size=1,
+        dtype=model.dtype,
+        device=device
+    )
+
+    # Setup streamer
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+    # Generation kwargs
+    generation_kwargs = {
+        **input_tokens,
+        "max_new_tokens": 512,
+        "streamer": streamer,
+        "do_sample": False,
+        "past_key_values": current_cache,
+        "use_cache": True,
+    }
+
+    # Generate in a separate thread to enable streaming
+    generation_thread = threading.Thread(target=model.generate, kwargs=generation_kwargs)
+    generation_thread.start()
+
+    # Track metrics
+    start_time = time.time()
+    first_token_time = None
+    token_count = 0
+    generated_text = ""
+
+    print("Assistant: ", end="", flush=True)
+
+    # Stream tokens
+    for token in streamer:
+        if first_token_time is None:
+            first_token_time = time.time()
+            time_to_first_token = first_token_time - start_time
+            print(f"[TTFT: {time_to_first_token*1000:.1f}ms] ", end="", flush=True)
+
+        print(token, end="", flush=True)
+        generated_text += token
+        token_count += 1
+
+    generation_thread.join()
+    end_time = time.time()
+
+    # Calculate metrics
+    total_time = end_time - start_time
+    generation_time = end_time - (first_token_time or start_time)
+    tokens_per_second = token_count / generation_time if generation_time > 0 else 0
+
+    # Add assistant response to history
+    conversation_history.append({"role": "assistant", "content": generated_text})
+
+    # Trim conversation history to prevent it from growing too large
+    trim_conversation_history()
+
+    # Print metrics
+    print(f"\n\n[Metrics] Tokens: {token_count} | "
+          f"Time: {total_time*1000:.1f}ms | "
+          f"Tokens/sec: {tokens_per_second:.1f} | "
+          f"TTFT: {(first_token_time - start_time)*1000:.1f}ms\n")
+
+def main():
+    print("="*60)
+    print("SubSec Chat Interface")
+    print("Type 'quit' or 'exit' to end the conversation")
+    print("Type 'clear', 'reset', or 'new' to clear conversation history")
+    print("="*60 + "\n")
+    
+    while True:
+        try:
+            user_input = input("You: ").strip()
+            
+            if not user_input:
+                continue
+            
+            if user_input.lower() in ['quit', 'exit', 'q']:
+                print("\nGoodbye!")
+                break
+            elif user_input.lower() in ['clear', 'reset', 'new']:
+                reset_cache()
+                print("Conversation history and cache cleared. Starting fresh!\n")
+                continue
+
+            generate_streaming_response(user_input)
+            
+        except KeyboardInterrupt:
+            print("\n\nGoodbye!")
+            break
+        except Exception as e:
+            print(f"\nError: {e}\n")
+
+if __name__ == "__main__":
+    main()
 
