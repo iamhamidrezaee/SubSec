@@ -96,15 +96,36 @@ if getattr(model, "generation_config", None) is not None:
     gen_cfg.num_beams = 1
     gen_cfg.do_sample = False
 
+# Warmup run to initialize CUDA kernels, compiled graphs, and cuDNN benchmarks
+if device == "cuda":
+    print("Warming up model (initializing CUDA kernels, compiled graphs, and cuDNN benchmarks)...")
+    try:
+        with torch.inference_mode():
+            # Use a realistic input length for better warmup
+            warmup_text = "Hello, how are you today? Tell me about yourself and who developed you?"
+            warmup_input = tokenizer(warmup_text, return_tensors="pt").to(device)
+            # Run a few tokens to warm up both prefill and decode phases
+            _ = model.generate(**warmup_input, max_new_tokens=3, use_cache=True, do_sample=False)
+            # Clear cache after warmup to start fresh
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        print("✓ Warmup complete!")
+    except Exception as e:
+        print(f"⚠ Warmup failed: {e}")
+
 print("Model loaded successfully!\n")
 
 # Conversation history
 conversation_history = []
 
 def reset_cache():
-    """Reset the conversation history"""
+    """Reset the conversation history and clear GPU cache"""
     global conversation_history
     conversation_history = []
+    if device == "cuda":
+        torch.cuda.empty_cache()
+        # Synchronize to ensure cache is cleared
+        torch.cuda.synchronize()
 
 def trim_conversation_history():
     """Trim conversation history to prevent context from becoming too long"""
@@ -115,7 +136,7 @@ def trim_conversation_history():
         conversation_history = conversation_history[-max_turns:]
 
 def generate_streaming_response(user_message):
-    """Generate streaming response with metrics"""
+    """Generate streaming response with metrics and optimized memory management"""
     # Add user message to history
     conversation_history.append({"role": "user", "content": user_message})
 
@@ -141,8 +162,7 @@ def generate_streaming_response(user_message):
         "max_new_tokens": 256,  # lower default for latency; adjust as needed
         "streamer": streamer,
         "do_sample": False,
-        "use_cache": True,
-        "num_beams": 1,
+        "use_cache": True,  # KV cache enabled for faster generation
         "eos_token_id": tokenizer.eos_token_id,
         "pad_token_id": tokenizer.pad_token_id,
     }
