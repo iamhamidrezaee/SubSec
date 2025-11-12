@@ -106,56 +106,52 @@ setup_environment() {
     print_info "Activating conda environment 'subsec'..."
     eval "$(conda shell.bash hook)"
     conda activate subsec
+    
+    # Verify we're using the right Python
+    if ! python -c "import sys; assert 'subsec' in sys.executable or 'subsec' in sys.prefix" 2>/dev/null; then
+        print_warning "Warning: May not be using the 'subsec' environment Python"
+    fi
+    print_info "Using Python: $(python --version) at $(which python)"
 
-    # Install PyTorch and torchvision via conda first (to get compatible MKL)
-    print_info "Installing PyTorch and torchvision via conda (pre-built binaries, faster)..."
-    conda install -y -c pytorch pytorch torchvision
-
-    # Check if we have MKL compatibility issues and fix if needed
-    print_info "Checking MKL compatibility..."
-    if ! python -c "import torch; print('PyTorch import successful')" 2>/dev/null; then
-        print_warning "PyTorch import failed, trying alternative MKL configuration..."
-        # Try using OpenBLAS instead of MKL to avoid compatibility issues
-        conda install -y -c conda-forge openblas blas=2.116
-        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    # Install PyTorch with CUDA support - use compatible versions from PyPI
+    # We don't install torchvision since we don't need it for text-only models
+    # This prevents the torchvision::nms operator error
+    print_info "Installing PyTorch with CUDA support (without torchvision)..."
+    if ! pip install torch --index-url https://download.pytorch.org/whl/cu121 2>/dev/null; then
+        print_warning "CUDA 12.1 PyTorch installation failed, trying CUDA 11.8..."
+        if ! pip install torch --index-url https://download.pytorch.org/whl/cu118 2>/dev/null; then
+            print_warning "CUDA PyTorch installation failed, installing CPU-only version..."
+            pip install torch
+        fi
     fi
 
-    # Install build dependencies for compiling flash-attn
-    print_info "Installing build dependencies (compilers, build tools)..."
-    conda install -y -c conda-forge ninja cmake gcc_linux-64 gxx_linux-64
+    # Verify PyTorch installation
+    if ! python -c "import torch; print(f'PyTorch {torch.__version__} installed successfully')" 2>/dev/null; then
+        print_error "PyTorch installation verification failed!"
+        return 1
+    fi
+
+    # Install core dependencies for streaming inference
+    print_info "Installing transformers and accelerate..."
+    pip install transformers accelerate
+
+    # Install build dependencies for flash-attn (optional, for performance)
+    print_info "Installing build dependencies for flash-attn (optional)..."
+    conda install -y -c conda-forge ninja cmake gcc_linux-64 gxx_linux-64 2>/dev/null || {
+        print_warning "Could not install build dependencies via conda, trying pip..."
+        pip install ninja cmake 2>/dev/null || print_warning "Build dependencies not available, flash-attn may not compile"
+    }
 
     # Set parallel compilation flags for faster builds
     NUM_CORES=$(nproc 2>/dev/null || echo "4")
     export MAX_JOBS="$NUM_CORES"
     export CMAKE_BUILD_PARALLEL_LEVEL="$NUM_CORES"
 
-    # Install transformers and accelerate (needed for inference.py)
-    print_info "Installing transformers and accelerate..."
-    pip install transformers accelerate
-
-    # Install additional packages needed for flash-attn build
-    print_info "Installing packaging and wheel for flash-attn build..."
-    pip install packaging wheel
-    
-    # Install flash-attn from source to ensure ABI compatibility with conda PyTorch
-    # Building from source ensures binary compatibility with the installed PyTorch version
-    print_info "Installing flash-attn from source (this may take 5-10 minutes)..."
-    print_info "This builds flash-attn against your PyTorch to ensure ABI compatibility..."
-    pip install 'git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3#egg=flash-attn&subdirectory=.' --no-build-isolation || {
-        print_warning "Flash-attn installation failed. This may impact performance but won't prevent the model from running."
-        print_warning "You can try installing it later with: pip install 'git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3#egg=flash-attn&subdirectory=.' --no-build-isolation"
-    }
-
-    # Install Mamba SSM kernels for hybrid Mamba-Attention models (like Granite)
-    # These provide optimized CUDA kernels for Mamba state space model layers
-    print_info "Installing causal-conv1d from source (this may take 2-3 minutes)..."
-    pip install causal-conv1d --no-build-isolation || {
-        print_warning "causal-conv1d installation failed. Mamba layers will use slower fallback implementation."
-    }
-
-    print_info "Installing mamba-ssm from source (this may take 3-5 minutes)..."
-    pip install mamba-ssm --no-build-isolation || {
-        print_warning "mamba-ssm installation failed. Mamba layers will use slower fallback implementation."
+    # Try to install flash-attn (optional, for better performance)
+    # This is optional - the code will work without it
+    print_info "Attempting to install flash-attn (optional, may take 5-10 minutes)..."
+    pip install 'git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3#egg=flash-attn&subdirectory=.' --no-build-isolation 2>/dev/null || {
+        print_warning "Flash-attn installation skipped (optional - code will work without it)"
     }
 
     print_success "All dependencies installed successfully!"
@@ -163,14 +159,24 @@ setup_environment() {
 
 # Main function
 main() {
-    # Exit on error
-    set -e
+    # Don't exit on error - we want to handle errors gracefully
+    set +e
     
     setup_conda
+    if [ $? -ne 0 ]; then
+        print_error "Conda setup failed!"
+        exit 1
+    fi
+    
     setup_environment
+    if [ $? -ne 0 ]; then
+        print_error "Environment setup failed!"
+        exit 1
+    fi
     
     print_step "✅ Setup Complete!"
     print_info "To activate the environment in future sessions, run: conda activate subsec"
+    print_info "You can now run: python inference_baseline.py or python inference.py"
 }
 
 # Run main function
