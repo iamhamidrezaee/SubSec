@@ -1,3 +1,24 @@
+#!/usr/bin/env python3
+"""
+SubSec Baseline: Naive Full-History Inference (for comparison)
+
+This is the BASELINE implementation that uses the standard approach:
+- Full conversation history concatenated into every prompt
+- No summarization or context bounding
+- No FlashAttention or kernel optimizations
+
+Purpose: Demonstrates the problem that SubSec solves by showing:
+- TTFT degradation over conversation turns
+- Memory issues (OOM) on hybrid models with long contexts
+- Inefficient compute usage from re-processing old context
+
+This baseline is INTENTIONALLY unoptimized to provide a fair comparison point.
+
+Usage:
+    python inference_baseline.py
+    MODEL_NAME_OR_PATH=ibm-granite/granite-4.0-micro python inference_baseline.py
+"""
+
 import os
 # Set environment variable BEFORE any other imports to prevent torchvision import
 os.environ["TRANSFORMERS_NO_TORCHVISION"] = "1"
@@ -8,20 +29,58 @@ import threading
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model_path = "ibm-granite/granite-4.0-micro"
+# Allow overriding the model via environment variable for fair comparisons
+model_path = os.environ.get("MODEL_NAME_OR_PATH", "ibm-granite/granite-4.0-micro")
 
 print(f"Loading model from {model_path}...")
 print(f"Using device: {device}")
 
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-# Plain model load: no Flash Attention, no special caches, no speculative decoding
+
+def format_chat_messages(messages):
+    """
+    Format messages into a single prompt for both chat and base models.
+
+    Baseline uses the same generic formatting strategy as the optimized
+    path when no tokenizer.chat_template is defined, for model-agnostic
+    behavior.
+    """
+    if getattr(tokenizer, "chat_template", None):
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    lines = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "user":
+            prefix = "User: "
+        elif role == "assistant":
+            prefix = "Assistant: "
+        elif role == "system":
+            prefix = "System: "
+        else:
+            prefix = ""
+        lines.append(prefix + content)
+
+    lines.append("Assistant: ")
+    return "\n".join(lines)
+
+
+# Plain model load: no Flash Attention, no custom KV cache, no speculative decoding.
+# We still use device_map='auto' on CUDA to avoid OOM on larger Granite-4-H models.
+torch_dtype = torch.float16 if device == "cuda" else torch.float32
 model = AutoModelForCausalLM.from_pretrained(
     model_path,
-    dtype=torch.float16 if device == "cuda" else torch.float32,
+    dtype=torch_dtype,
+    device_map="auto" if device == "cuda" else None,
+    low_cpu_mem_usage=True,
 )
 model.eval()
-model.to(device)
 
 print("Model loaded successfully!\n")
 
@@ -46,12 +105,8 @@ def generate_streaming_response(user_message):
     # Add user message to history
     conversation_history.append({"role": "user", "content": user_message})
 
-    # Format chat with history
-    chat_text = tokenizer.apply_chat_template(
-        conversation_history,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+    # Format chat with history (chat-template aware + base-model fallback)
+    chat_text = format_chat_messages(conversation_history)
     input_tokens = tokenizer(chat_text, return_tensors="pt").to(device)
 
     # Setup streamer
@@ -112,7 +167,7 @@ def generate_streaming_response(user_message):
 def main():
     print("="*60)
     print("SubSec Chat Interface (Baseline)")
-    print("Model: ibm-granite/granite-4.0-micro")
+    print(f"Model: {model_path}")
     print("No Flash Attention, no custom KV cache, no speculative decoding")
     print("Type 'quit' or 'exit' to end the conversation")
     print("Type 'clear', 'reset', or 'new' to clear conversation history")
