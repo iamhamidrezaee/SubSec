@@ -135,6 +135,25 @@ setup_environment() {
     print_info "Installing transformers and accelerate..."
     pip install transformers accelerate
 
+    # Install Mamba-2 / SSM dependencies for hybrid Granite-4 models
+    # These provide fused GPU kernels for the Mamba layers used in hybrid Granite-4.x-H models.
+    # NOTE: This is the Mamba SSM library (mamba-ssm), NOT the conda solver called 'mamba'.
+    print_info "Installing Mamba-SSM fused kernels and causal-conv1d for hybrid Granite-4 models (optional but recommended)..."
+    if ! pip install "mamba-ssm>=2.0.0" "causal-conv1d>=1.0.0" einops 2>/dev/null; then
+        print_warning "Mamba-SSM / causal-conv1d installation failed or is unavailable for this platform."
+        print_warning "Granite-4 hybrid (H) models will still run but Mamba layers may be slower (fallback PyTorch kernels)."
+    fi
+
+    # Verify that Mamba-SSM and causal-conv1d are importable (for hybrid models)
+    python - << 'PY' 2>/dev/null
+try:
+    import mamba_ssm  # type: ignore
+    import causal_conv1d  # type: ignore
+    print("Mamba-SSM and causal-conv1d detected for hybrid Granite-4 models.")
+except Exception as e:
+    print("Warning: Optimized Mamba-SSM / causal-conv1d kernels not fully available:", e)
+PY
+
     # Install build dependencies for flash-attn (optional, for performance)
     print_info "Installing build dependencies for flash-attn (optional)..."
     conda install -y -c conda-forge ninja cmake gcc_linux-64 gxx_linux-64 2>/dev/null || {

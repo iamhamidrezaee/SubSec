@@ -13,12 +13,25 @@ from transformers.utils import is_flash_attn_2_available
 # ------------------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Enforce non-hybrid, full-attention model to avoid Mamba/SSM paths and their warnings
-# Allow override via env var if needed, but default to non-hybrid.
+# Default to a Granite-4 dense attention model, but allow override via env var
 model_path = os.environ.get("MODEL_NAME_OR_PATH", "ibm-granite/granite-4.0-micro")
+
+def is_granite_4(model_name: str) -> bool:
+    return "granite-4.0" in model_name
+
+def is_granite_4_hybrid(model_name: str) -> bool:
+    # Hybrid Granite-4 models are denoted with "-h-" in the name
+    return "granite-4.0-h-" in model_name
+
+is_granite = is_granite_4(model_path)
+is_hybrid = is_granite_4_hybrid(model_path)
 
 print(f"Loading model from {model_path}...")
 print(f"Using device: {device}")
+if is_granite:
+    print(f"Detected Granite-4 family model ({'hybrid Mamba + Attention' if is_hybrid else 'dense Attention-only'})")
+else:
+    print("Detected non-Granite model (generic SubSec optimization path).")
 
 # ------------------------------
 # Performance knobs for latency
@@ -47,15 +60,39 @@ if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
 tokenizer.padding_side = "right"
 
 # ------------------------------
-# Model load with FlashAttention 2
+# Model load configuration: FlashAttention 2 and Mamba-SSM
 # ------------------------------
 use_flash_attn_2 = device == "cuda" and is_flash_attn_2_available()
 attn_impl = "flash_attention_2" if use_flash_attn_2 else "eager"
 
 if use_flash_attn_2:
-    print("Attempting to load with Flash Attention 2...")
+    print("Attempting to load with Flash Attention 2 for attention blocks...")
 else:
-    print("Flash Attention 2 not available; using standard attention.")
+    print("Flash Attention 2 not available; using standard attention kernels.")
+
+# For hybrid Granite-4-H models, prefer using remote code so their custom Mamba + Attention
+# architecture is fully enabled. Allow explicit override via SUBSEC_TRUST_REMOTE_CODE.
+explicit_trust = os.environ.get("SUBSEC_TRUST_REMOTE_CODE")
+if explicit_trust is not None:
+    trust_remote_code = explicit_trust.strip().lower() in ("1", "true", "yes", "y", "on")
+elif is_hybrid:
+    trust_remote_code = True
+else:
+    trust_remote_code = False
+
+has_mamba_kernels = False
+if is_hybrid:
+    # Hybrid Granite-4 models use Mamba-2 style SSM layers; if mamba-ssm and causal-conv1d
+    # are available, their fused CUDA kernels will be used under the hood.
+    try:
+        import mamba_ssm  # type: ignore
+        import causal_conv1d  # type: ignore
+        has_mamba_kernels = True
+        print("Detected optimized Mamba-SSM and causal-conv1d kernels for hybrid Granite-4 models.")
+    except Exception as e:
+        print("⚠ Optimized Mamba-SSM / causal-conv1d kernels not fully available; "
+              "hybrid Mamba layers will run with fallback PyTorch kernels.")
+        print(f"  Details: {e}")
 
 try:
     # Use device_map='auto' to load directly to GPU memory without extra host<->device copies
@@ -65,10 +102,10 @@ try:
         device_map="auto" if device == "cuda" else None,
         attn_implementation=attn_impl,
         low_cpu_mem_usage=True,
-        trust_remote_code=False,
+        trust_remote_code=trust_remote_code,
     )
     if use_flash_attn_2:
-        print("✓ Flash Attention 2 enabled successfully!")
+        print("✓ Flash Attention 2 enabled successfully for attention blocks!")
 except Exception as e:
     print(f"⚠ Could not enable requested attention implementation ({attn_impl}): {e}")
     print("Falling back to standard attention (install flash-attn for better performance).")
@@ -78,10 +115,32 @@ except Exception as e:
         device_map="auto" if device == "cuda" else None,
         attn_implementation="eager",
         low_cpu_mem_usage=True,
-        trust_remote_code=False,
+        trust_remote_code=trust_remote_code,
     )
 
 model.eval()
+
+# Print a concise model + kernel summary for the SubSec demo / latency report
+cfg = getattr(model, "config", None)
+arch = getattr(cfg, "architectures", None) if cfg is not None else None
+max_ctx = getattr(cfg, "max_position_embeddings", None) if cfg is not None else None
+hidden_size = getattr(cfg, "hidden_size", None) if cfg is not None else None
+num_layers = getattr(cfg, "num_hidden_layers", None) if cfg is not None else None
+
+print("---- SubSec Model Summary ----")
+print(f"Model ID          : {model_path}")
+if arch:
+    print(f"Architecture      : {', '.join(arch)}")
+if max_ctx is not None:
+    print(f"Max context (cfg) : {max_ctx} tokens")
+if hidden_size is not None and num_layers is not None:
+    print(f"Hidden size       : {hidden_size}, Layers: {num_layers}")
+print(f"Granite-4 family  : {'yes' if is_granite else 'no'}")
+print(f"Hybrid (Mamba+Att): {'yes' if is_hybrid else 'no'}")
+print(f"FlashAttention 2  : {'ON' if use_flash_attn_2 else 'OFF'}")
+if is_hybrid:
+    print(f"Mamba-SSM kernels : {'ON (fused CUDA kernels)' if has_mamba_kernels else 'OFF (fallback PyTorch kernels)'}")
+print("------------------------------")
 
 # Generation defaults for low latency
 if getattr(model, "generation_config", None) is not None:
@@ -159,7 +218,7 @@ def generate_streaming_response(user_message):
     # The model will handle caching internally with use_cache=True
     generation_kwargs = {
         **input_tokens,
-        "max_new_tokens": 256,  # lower default for latency; adjust as needed
+        "max_new_tokens": 2048,  # high safety cap; model will stop naturally at EOS token
         "streamer": streamer,
         "do_sample": False,
         "use_cache": True,  # KV cache enabled for faster generation
